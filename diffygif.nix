@@ -13,6 +13,6 @@ mkDerivation {
     JuicyPixels latex-formulae-image mtl pandoc process temporary
     transformers
   ];
-  executableHaskellDepends = [ base bytestring mtl ];
+  executableHaskellDepends = [ base bytestring data-default mtl ];
   license = stdenv.lib.licenses.bsd3;
 }

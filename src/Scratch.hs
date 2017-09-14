@@ -1,4 +1,6 @@
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE RankNTypes #-}
 module Scratch where
 
 import Control.Monad.Except
@@ -7,14 +9,20 @@ import Data.Default
 
 import Text.Pandoc.Error
 import Text.Pandoc.Options
+import Text.Pandoc.Templates
 import Text.Pandoc.Readers.Markdown
 import Text.Pandoc.Writers.LaTeX
 import Codec.Picture.Png
-import qualified Data.ByteString.Lazy as B
+import Codec.Picture.Gif
+import Codec.Picture.Types
+import Data.Algorithm.Diff
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Lazy as BL
 
 -- from image latex render
 import Codec.Picture
 import Data.Maybe
+import Data.List (splitAt)
 import Control.Error.Util
 import Data.List
 import System.IO.Temp
@@ -27,10 +35,11 @@ import System.Exit
 import Control.Exception
 import Control.Arrow(second)
 import Control.Applicative
-import Data.Monoid
+import Data.Monoid ((<>))
 
 data Error =
-    EPandoc PandocError
+    EPandocTemplate IOException
+  | EPandoc PandocError
   | ERender RenderError
   | EImage String
   deriving Show
@@ -39,120 +48,150 @@ data Error =
 -- take diffs between each stop :: [[Content]]
 -- need config options for language and the pauses between keypresses / stops
 -- add markdown fences and language
--- would be nice to be able to get hold of the preamble programmatically
 -- styles for the code highlighting would be good as well
+
+data Config =
+  Config {
+    cLanguage :: String
+  , cKeyPause :: Int
+  , cSectionPause :: Int
+  , cBackground :: PixelRGB8
+  }
+
+instance Default Config where
+  def = Config "haskell" 10 75 (PixelRGB8 255 255 255)
+
+loadAndOrderFiles :: FilePath -> IO [String]
+loadAndOrderFiles fp = do
+  files <- listDirectory fp
+  traverse (readFile . (fp <>)) (sort files)
+
+past :: Diff a -> Maybe a
+past (Both x _) = Just x
+past (First x)  = Just x
+past (Second _) = Nothing
+
+pasts :: [Diff a] -> [a]
+pasts = mapMaybe past
+
+future :: Diff a -> Maybe a
+future (Both _ x) = Just x
+future (Second x) = Just x
+future (First x)  = Nothing
+
+futures :: [Diff a] -> [a]
+futures = mapMaybe future
+
+-- we should diff by lines first
+-- then diff each line to simulate the typing
+
+-- maybe try to add the newlines first
+-- look at each chunked change, and if the number of lines is about to increase, add
+-- a frame for the addition of each newline first?
+diffs :: String -> String -> [String]
+diffs s1 s2 =
+  let
+    diffs = getDiff s1 s2
+
+    splits = fmap (\i -> splitAt i diffs) [0 .. length diffs]
+    joins = fmap (\(x,y) -> futures x ++ pasts y) splits
+
+    -- we can do much better than this in terms of running time
+    -- a = fmap futures . inits $ diffs
+    -- b = fmap pasts . tails $ diffs
+    -- joins = zipWith (++) a b
+  in
+    map head . group $ joins
+
+chunkify :: [String] -> [[String]]
+chunkfiy [] = []
+chunkify xs = zipWith diffs xs (tail xs)
+
+palettedMap :: (forall pixel. Pixel pixel => Image pixel -> a) -> PalettedImage -> a 
+palettedMap f (TrueColorImage d) = dynamicMap f d
+palettedMap f (PalettedY8 i _) = f i
+palettedMap f (PalettedRGB8 i _) = f i
+palettedMap f (PalettedRGBA8 i _) = f i
+palettedMap f (PalettedRGB16 i _) = f i
+
+makeGif :: Config -> [[String]] -> ExceptT Error IO BL.ByteString
+makeGif c pieces = do
+  let
+    f s = (markdownToLatex . codeToMarkdown c $ s) >>= latexToImage
+
+  images <- traverse (traverse f) pieces
+  let
+    maxWidth = maximum . fmap (palettedMap imageWidth) . mconcat $ images
+    maxHeight = maximum . fmap (palettedMap imageHeight) . mconcat $ images
+
+  let
+    resize ip =
+      let
+        h i x y =
+          if 0 <= x && x < imageWidth i && 0 <= y && y < imageHeight i
+          then pixelAt i x y
+          else pixelAt i 0 0
+      in
+        case ip of
+          PalettedY8 i p    -> PalettedY8 (generateImage (h i) maxWidth maxHeight) p
+          PalettedRGB8 i p  -> PalettedRGB8 (generateImage (h i) maxWidth maxHeight) p
+          PalettedRGBA8 i p -> PalettedRGBA8 (generateImage (h i) maxWidth maxHeight) p
+          PalettedRGB16 i p -> PalettedRGB16 (generateImage (h i) maxWidth maxHeight) p
+          TrueColorImage di -> TrueColorImage di -- should make this explode
+    images' = fmap (fmap resize) images
+
+  let
+    g (PalettedRGB8 i p)   = pure (palettedAsImage p, cKeyPause c, i)
+    g (PalettedRGBA8 i p)  = pure (dropAlphaLayer (palettedAsImage p), cKeyPause c, i)
+    g _ = throwError $ EImage "dodgy image"
+
+  bits <- traverse (traverse g) images'
+
+  let
+    modifyPause [] = []
+    modifyPause ((p, _, i) : xs) = (p, cSectionPause c, i) : xs
+    bits' = fmap modifyPause bits
+
+  case encodeGifImages LoopingForever (mconcat bits') of
+    Left e -> throwError $ EImage e
+    Right b -> pure b
+
+codeToMarkdown ::
+  Config ->
+  String ->
+  String
+codeToMarkdown c s =
+  mconcat [
+      "```"
+    , cLanguage c
+    , "\n"
+    , s
+    , "\n```"
+    ]
 
 markdownToLatex :: String -> ExceptT Error IO String
 markdownToLatex s =
   let
      em = readMarkdown def s
-  in
+  in do
+    et <- liftIO $ getDefaultTemplate Nothing "latex"
+    t <- case et of
+      Left e -> throwError $ EPandocTemplate e
+      Right s -> pure s
     case em of
       Left e -> throwError $ EPandoc e
-      Right p -> pure $ writeLaTeX ( def { writerHighlight = True } ) p
+      Right p -> pure $ writeLaTeX ( def { writerTemplate = Just t
+                                         , writerHighlight = True
+                                         , writerVariables  = [("header-includes", "\\pagestyle{empty}\n")]
+                                         } ) p
 
-latexToImage :: String -> ExceptT Error IO B.ByteString
+latexToImage :: String -> ExceptT Error IO PalettedImage
 latexToImage s = do
-  ei <- liftIO $ imageForFormula defaultEnv ( FormulaOptions pre "chapter" 200 ) s
-  di <- case ei of
-          Left e -> throwError $ ERender e
-          Right (_, x) -> pure x
-  case encodeDynamicPng di of
-    Left e -> throwError $ EImage s
+  ei <- liftIO $ imageForFormula defaultEnv ( FormulaOptions "" "" 200 ) s
+  case ei of
+    Left e -> throwError $ ERender e
     Right x -> pure x
 
-pre :: String
-pre = unlines
-    [ "\\usepackage{lmodern}",
-    "\\usepackage{amssymb,amsmath}",
-    "\\usepackage{ifxetex,ifluatex}",
-    "\\usepackage{fixltx2e} % provides \\textsubscript",
-    "\\ifnum 0\\ifxetex 1\\fi\\ifluatex 1\\fi=0 % if pdftex",
-    "  \\usepackage[T1]{fontenc}",
-    "  \\usepackage[utf8]{inputenc}",
-    "\\else % if luatex or xelatex",
-    "  \\ifxetex",
-    "    \\usepackage{mathspec}",
-    "  \\else",
-    "    \\usepackage{fontspec}",
-    "  \\fi",
-    "  \\defaultfontfeatures{Ligatures=TeX,Scale=MatchLowercase}",
-    "\\fi",
-    "% use upquote if available, for straight quotes in verbatim environments",
-    "\\IfFileExists{upquote.sty}{\\usepackage{upquote}}{}",
-    "% use microtype if available",
-    "\\IfFileExists{microtype.sty}{%",
-    "\\usepackage[]{microtype}",
-    "\\UseMicrotypeSet[protrusion]{basicmath} % disable protrusion for tt fonts",
-    "}{}",
-    "\\PassOptionsToPackage{hyphens}{url} % url is loaded by hyperref",
-    "\\usepackage[unicode=true]{hyperref}",
-    "\\hypersetup{",
-    "            pdfborder={0 0 0},",
-    "            breaklinks=true}",
-    "\\urlstyle{same}  % don't use monospace font for urls",
-    "\\usepackage{color}",
-    "\\usepackage{fancyvrb}",
-    "\\newcommand{\\VerbBar}{|}",
-    "\\newcommand{\\VERB}{\\Verb[commandchars=\\\\\\{\\}]}",
-    "\\DefineVerbatimEnvironment{Highlighting}{Verbatim}{commandchars=\\\\\\{\\}}",
-    "% Add ',fontsize=\\small' for more characters per line",
-    "\\newenvironment{Shaded}{}{}",
-    "\\newcommand{\\KeywordTok}[1]{\\textcolor[rgb]{0.00,0.44,0.13}{\\textbf{#1}}}",
-    "\\newcommand{\\DataTypeTok}[1]{\\textcolor[rgb]{0.56,0.13,0.00}{#1}}",
-    "\\newcommand{\\DecValTok}[1]{\\textcolor[rgb]{0.25,0.63,0.44}{#1}}",
-    "\\newcommand{\\BaseNTok}[1]{\\textcolor[rgb]{0.25,0.63,0.44}{#1}}",
-    "\\newcommand{\\FloatTok}[1]{\\textcolor[rgb]{0.25,0.63,0.44}{#1}}",
-    "\\newcommand{\\ConstantTok}[1]{\\textcolor[rgb]{0.53,0.00,0.00}{#1}}",
-    "\\newcommand{\\CharTok}[1]{\\textcolor[rgb]{0.25,0.44,0.63}{#1}}",
-    "\\newcommand{\\SpecialCharTok}[1]{\\textcolor[rgb]{0.25,0.44,0.63}{#1}}",
-    "\\newcommand{\\StringTok}[1]{\\textcolor[rgb]{0.25,0.44,0.63}{#1}}",
-    "\\newcommand{\\VerbatimStringTok}[1]{\\textcolor[rgb]{0.25,0.44,0.63}{#1}}",
-    "\\newcommand{\\SpecialStringTok}[1]{\\textcolor[rgb]{0.73,0.40,0.53}{#1}}",
-    "\\newcommand{\\ImportTok}[1]{#1}",
-    "\\newcommand{\\CommentTok}[1]{\\textcolor[rgb]{0.38,0.63,0.69}{\\textit{#1}}}",
-    "\\newcommand{\\DocumentationTok}[1]{\\textcolor[rgb]{0.73,0.13,0.13}{\\textit{#1}}}",
-    "\\newcommand{\\AnnotationTok}[1]{\\textcolor[rgb]{0.38,0.63,0.69}{\\textbf{\\textit{#1}}}}",
-    "\\newcommand{\\CommentVarTok}[1]{\\textcolor[rgb]{0.38,0.63,0.69}{\\textbf{\\textit{#1}}}}",
-    "\\newcommand{\\OtherTok}[1]{\\textcolor[rgb]{0.00,0.44,0.13}{#1}}",
-    "\\newcommand{\\FunctionTok}[1]{\\textcolor[rgb]{0.02,0.16,0.49}{#1}}",
-    "\\newcommand{\\VariableTok}[1]{\\textcolor[rgb]{0.10,0.09,0.49}{#1}}",
-    "\\newcommand{\\ControlFlowTok}[1]{\\textcolor[rgb]{0.00,0.44,0.13}{\\textbf{#1}}}",
-    "\\newcommand{\\OperatorTok}[1]{\\textcolor[rgb]{0.40,0.40,0.40}{#1}}",
-    "\\newcommand{\\BuiltInTok}[1]{#1}",
-    "\\newcommand{\\ExtensionTok}[1]{#1}",
-    "\\newcommand{\\PreprocessorTok}[1]{\\textcolor[rgb]{0.74,0.48,0.00}{#1}}",
-    "\\newcommand{\\AttributeTok}[1]{\\textcolor[rgb]{0.49,0.56,0.16}{#1}}",
-    "\\newcommand{\\RegionMarkerTok}[1]{#1}",
-    "\\newcommand{\\InformationTok}[1]{\\textcolor[rgb]{0.38,0.63,0.69}{\\textbf{\\textit{#1}}}}",
-    "\\newcommand{\\WarningTok}[1]{\\textcolor[rgb]{0.38,0.63,0.69}{\\textbf{\\textit{#1}}}}",
-    "\\newcommand{\\AlertTok}[1]{\\textcolor[rgb]{1.00,0.00,0.00}{\\textbf{#1}}}",
-    "\\newcommand{\\ErrorTok}[1]{\\textcolor[rgb]{1.00,0.00,0.00}{\\textbf{#1}}}",
-    "\\newcommand{\\NormalTok}[1]{#1}",
-    "\\IfFileExists{parskip.sty}{%",
-    "\\usepackage{parskip}",
-    "}{% else",
-    "\\setlength{\\parindent}{0pt}",
-    "\\setlength{\\parskip}{6pt plus 2pt minus 1pt}",
-    "}",
-    "\\setlength{\\emergencystretch}{3em}  % prevent overfull lines",
-    "\\providecommand{\\tightlist}{%",
-    "  \\setlength{\\itemsep}{0pt}\\setlength{\\parskip}{0pt}}",
-    "\\setcounter{secnumdepth}{0}",
-    "% Redefines (sub)paragraphs to behave more like sections",
-    "\\ifx\\paragraph\\undefined\\else",
-    "\\let\\oldparagraph\\paragraph",
-    "\\renewcommand{\\paragraph}[1]{\\oldparagraph{#1}\\mbox{}}",
-    "\\fi",
-    "\\ifx\\subparagraph\\undefined\\else",
-    "\\let\\oldsubparagraph\\subparagraph",
-    "\\renewcommand{\\subparagraph}[1]{\\oldsubparagraph{#1}\\mbox{}}",
-    "\\fi",
-    "",
-    "% set default figure placement to htbp",
-    "\\makeatletter",
-    "\\def\\fps@figure{htbp}",
-    "\\makeatother"]
 -- | This type contains all possible errors than can happen while rendering an equation.
 --   It includes all IO errors that can happen as well as more specific errors.
 data RenderError = ImageIsEmpty -- ^ The equation produced an empty image
@@ -212,15 +251,18 @@ type Baseline = Int
 
 
 -- | Convert a formula into a JuicyPixels 'DynamicImage', also detecting where the typesetting baseline of the image is.
-imageForFormula :: EnvironmentOptions -> FormulaOptions -> Formula -> IO (Either RenderError (Baseline, DynamicImage))
+imageForFormula :: EnvironmentOptions -> FormulaOptions -> Formula -> IO (Either RenderError PalettedImage)
 imageForFormula (EnvironmentOptions {..}) (FormulaOptions {..}) eqn =
     bracket getCurrentDirectory setCurrentDirectory $ const $ withTemp $ \temp -> runExceptT $ do
+  {-
       let doc = mconcat ["\\nonstopmode\n",
                  "\\documentclass[12pt]{article}\n",
                  "\\pagestyle{empty}\n", preamble,
                  "\\begin{document}\n",
                  eqn,
                  "\\end{document}\n"]
+  -}
+      let doc = mconcat ["\\nonstopmode\n", eqn]
       io $ writeFile (temp </> tempFileBaseName <.> "tex") doc
       io $ setCurrentDirectory temp
       (c,o,e) <- io $ flip (readProcessWithExitCode latexCommand) "" $ latexArgs ++ [tempFileBaseName <.> "tex"]
@@ -235,19 +277,21 @@ imageForFormula (EnvironmentOptions {..}) (FormulaOptions {..}) eqn =
       (c'', o'', e'') <- io $ flip (readProcessWithExitCode imageMagickCommand) "" $
                                 [ "-density", show dpi
                                 , "-bordercolor", "none"
-                                , "-border", "1x1"
-                                , "-trim"
+                                , "-border", "3x3"
+                                -- , "-trim"
+                                , "-type", "palette"
+                                , "+antialias"
                                 , "-background", "none"
-                                , "-splice","1x0"
+                                -- , "-splice","1x0"
                                 ] ++ imageMagickArgs ++
                                 [ tempFileBaseName <.> "ps", tempFileBaseName <.> "png" ]
       io $ removeFile (tempFileBaseName <.> "ps")
       when (c'' /= ExitSuccess) $ throwE $ IMConvertFailure (o'' ++ "\n" ++ e'')
-      imgM <- io $ readImage (tempFileBaseName <.> "png")
-      img <- withExceptT ImageReadError $ hoistEither imgM
+      imgB <- io $ B.readFile (tempFileBaseName <.> "png")
       io $ removeFile $ tempFileBaseName <.> "png"
-      -- hoistEither $ postprocess img
-      pure (0, img)
+      case decodePngWithPaletteAndMetadata imgB of
+        Left e -> throwError $ ImageReadError e
+        Right (i, _) -> pure i
   where
     io = withExceptT IOException . tryIO
     withTemp a = case tempDir of

@@ -36,6 +36,7 @@ executable runme
   build-depends:       base >=4.9 && <4.10
                      , mtl >=2.2 && <2.3
                      , bytestring
+                     , data-default
                      , diffygif
   hs-source-dirs:      exe
   default-language:    Haskell2010
