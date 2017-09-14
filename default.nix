@@ -15,7 +15,7 @@ let
                then pkgs.haskellPackages
                else pkgs.haskell.packages.${compiler};
 
-  drv = haskellPackages.callPackage ./diffgif.nix {};
+  drv = haskellPackages.callPackage ./diffygif.nix {};
   drvWithDeps = pkgs.haskell.lib.overrideCabal drv (drv: {
     librarySystemDepends = (drv.librarySystemDepends or []) ++ [mytexlive pkgs.imagemagick pkgs.ghostscript];
   });

@@ -3,7 +3,7 @@
 , process, stdenv, temporary, transformers
 }:
 mkDerivation {
-  pname = "diffgif";
+  pname = "diffygif";
   version = "0.1.0.0";
   src = ./.;
   isLibrary = true;
