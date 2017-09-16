@@ -22,6 +22,8 @@ library
                      , Diff
                      , data-default
                      , pandoc
+                     , skylighting
+                     , hex
                      , JuicyPixels
                      , latex-formulae-image
                      , errors

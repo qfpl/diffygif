@@ -3,6 +3,8 @@
 {-# LANGUAGE RankNTypes #-}
 module Scratch where
 
+import Data.Char
+
 import Control.Monad.Except
 
 import Data.Default
@@ -12,6 +14,8 @@ import Text.Pandoc.Options
 import Text.Pandoc.Templates
 import Text.Pandoc.Readers.Markdown
 import Text.Pandoc.Writers.LaTeX
+import Skylighting
+import Data.Hex
 import Codec.Picture.Png
 import Codec.Picture.Gif
 import Codec.Picture.Types
@@ -44,22 +48,34 @@ data Error =
   | EImage String
   deriving Show
 
--- load all code files in order :: [Content]
--- take diffs between each stop :: [[Content]]
--- need config options for language and the pauses between keypresses / stops
--- add markdown fences and language
--- styles for the code highlighting would be good as well
-
 data Config =
   Config {
     cLanguage :: String
   , cKeyPause :: Int
   , cSectionPause :: Int
-  , cBackground :: PixelRGB8
+  , cStyle :: Style
   }
 
 instance Default Config where
-  def = Config "haskell" 10 75 (PixelRGB8 255 255 255)
+  def = Config "haskell" 10 75 pygments
+
+configBackground :: Config -> PixelRGB8
+configBackground =
+  let
+    f (RGB r g b) = PixelRGB8 r g b
+  in
+    fromMaybe (PixelRGB8 245 245 245) . 
+    fmap f . 
+    backgroundColor . 
+    cStyle
+
+configBackgroundString :: Config -> String
+configBackgroundString c = 
+  let
+    PixelRGB8 r g b = configBackground c
+    h = hex . pure . chr . fromIntegral
+  in
+    mconcat ["#", h r, h g, h b]
 
 loadAndOrderFiles :: FilePath -> IO [String]
 loadAndOrderFiles fp = do
@@ -71,41 +87,75 @@ past (Both x _) = Just x
 past (First x)  = Just x
 past (Second _) = Nothing
 
-pasts :: [Diff a] -> [a]
-pasts = mapMaybe past
-
 future :: Diff a -> Maybe a
 future (Both _ x) = Just x
 future (Second x) = Just x
 future (First x)  = Nothing
 
-futures :: [Diff a] -> [a]
-futures = mapMaybe future
-
--- we should diff by lines first
--- then diff each line to simulate the typing
-
--- maybe try to add the newlines first
--- look at each chunked change, and if the number of lines is about to increase, add
--- a frame for the addition of each newline first?
-diffs :: String -> String -> [String]
+diffs :: Eq a => [a] -> [a] -> [[a]]
 diffs s1 s2 =
   let
     diffs = getDiff s1 s2
 
-    splits = fmap (\i -> splitAt i diffs) [0 .. length diffs]
-    joins = fmap (\(x,y) -> futures x ++ pasts y) splits
+    fa xs d = case future d of
+      Nothing -> xs
+      Just x -> x : xs
+    a = fmap reverse . scanl fa [] $ diffs
 
-    -- we can do much better than this in terms of running time
-    -- a = fmap futures . inits $ diffs
-    -- b = fmap pasts . tails $ diffs
-    -- joins = zipWith (++) a b
+    fb d xs = case past d of
+      Nothing -> xs
+      Just x -> x : xs
+    b = scanr fb [] diffs
+
+    joins = zipWith (++) a b
   in
     map head . group $ joins
 
+interdiffs :: Eq a => [[a]] -> [[[a]]]
+interdiffs [] = []
+interdiffs xs = zipWith diffs xs (tail xs)
+
+-- we should diff by lines first
+-- then diff each line to simulate the typing
+
+-- what about multi-line edits?
+
+-- maybe try to add the newlines first
+-- look at each chunked change, and if the number of lines is about to increase, add
+-- a frame for the addition of each newline first?
+
+-- this is scoping what we have to lines,
+-- but it is not dealing well with line edits
+-- (see the Falsish change in test-data-1)
+--
+-- we possibly want slightly different approaches here for lines and chars
+-- lines are added and removed when we have blocks changing at once
+--
+-- when we have different first and second for lines, we probably
+-- want to turn them into strings and switch to the character diff
 chunkify :: [String] -> [[String]]
-chunkfiy [] = []
-chunkify xs = zipWith diffs xs (tail xs)
+chunkfiy [] =
+  []
+chunkify xs =
+  {-
+  let
+    ys = fmap lines xs
+    res = interdiffs ys
+    out = fmap (fmap unlines) res
+    out' = concatMap interdiffs out
+  in
+    out'
+   -}
+  interdiffs xs
+
+-- possibly generate and use a manifest for the timing
+-- - so it can be edited to tweak the whole thing
+
+-- possibly generate nix files to do the image processing
+-- - gives us caching, would help while doing editing tweaks
+-- - would open the door to stitching together all of the images
+--   using ImageMagick
+
 
 palettedMap :: (forall pixel. Pixel pixel => Image pixel -> a) -> PalettedImage -> a 
 palettedMap f (TrueColorImage d) = dynamicMap f d
@@ -117,7 +167,7 @@ palettedMap f (PalettedRGB16 i _) = f i
 makeGif :: Config -> [[String]] -> ExceptT Error IO BL.ByteString
 makeGif c pieces = do
   let
-    f s = (markdownToLatex . codeToMarkdown c $ s) >>= latexToImage
+    f s = (markdownToLatex c . codeToMarkdown c $ s) >>= latexToImage c
 
   images <- traverse (traverse f) pieces
   let
@@ -150,7 +200,13 @@ makeGif c pieces = do
   let
     modifyPause [] = []
     modifyPause ((p, _, i) : xs) = (p, cSectionPause c, i) : xs
-    bits' = fmap modifyPause bits
+    tweakLast' [] = []
+    tweakLast' [(p, _, i)] = [(p, cSectionPause c, i)]
+    tweakLast' (x : xs) = x : tweakLast' xs
+    tweakLast [] = []
+    tweakLast [x] = [tweakLast' x]
+    tweakLast (x : xs) = x : tweakLast xs
+    bits' = tweakLast . fmap modifyPause $ bits
 
   case encodeGifImages LoopingForever (mconcat bits') of
     Left e -> throwError $ EImage e
@@ -169,8 +225,8 @@ codeToMarkdown c s =
     , "\n```"
     ]
 
-markdownToLatex :: String -> ExceptT Error IO String
-markdownToLatex s =
+markdownToLatex :: Config -> String -> ExceptT Error IO String
+markdownToLatex c s =
   let
      em = readMarkdown def s
   in do
@@ -180,14 +236,16 @@ markdownToLatex s =
       Right s -> pure s
     case em of
       Left e -> throwError $ EPandoc e
-      Right p -> pure $ writeLaTeX ( def { writerTemplate = Just t
-                                         , writerHighlight = True
-                                         , writerVariables  = [("header-includes", "\\pagestyle{empty}\n")]
-                                         } ) p
+      Right p -> pure $ 
+        writeLaTeX ( def { writerTemplate = Just t
+                         , writerHighlight = True
+                         , writerHighlightStyle = cStyle c
+                         , writerVariables  = [("header-includes", "\\pagestyle{empty}\n")]
+                         } ) p
 
-latexToImage :: String -> ExceptT Error IO PalettedImage
-latexToImage s = do
-  ei <- liftIO $ imageForFormula defaultEnv ( FormulaOptions "" "" 200 ) s
+latexToImage :: Config -> String -> ExceptT Error IO PalettedImage
+latexToImage c s = do
+  ei <- liftIO $ imageForFormula c defaultEnv ( FormulaOptions "" "" 200 ) s
   case ei of
     Left e -> throwError $ ERender e
     Right x -> pure x
@@ -248,20 +306,10 @@ type Formula = String
 -- | Number of pixels from the bottom of the image to the typesetting baseline. Useful for setting your formulae inline with text.
 type Baseline = Int
 
-
-
 -- | Convert a formula into a JuicyPixels 'DynamicImage', also detecting where the typesetting baseline of the image is.
-imageForFormula :: EnvironmentOptions -> FormulaOptions -> Formula -> IO (Either RenderError PalettedImage)
-imageForFormula (EnvironmentOptions {..}) (FormulaOptions {..}) eqn =
+imageForFormula :: Config -> EnvironmentOptions -> FormulaOptions -> Formula -> IO (Either RenderError PalettedImage)
+imageForFormula config (EnvironmentOptions {..}) (FormulaOptions {..}) eqn =
     bracket getCurrentDirectory setCurrentDirectory $ const $ withTemp $ \temp -> runExceptT $ do
-  {-
-      let doc = mconcat ["\\nonstopmode\n",
-                 "\\documentclass[12pt]{article}\n",
-                 "\\pagestyle{empty}\n", preamble,
-                 "\\begin{document}\n",
-                 eqn,
-                 "\\end{document}\n"]
-  -}
       let doc = mconcat ["\\nonstopmode\n", eqn]
       io $ writeFile (temp </> tempFileBaseName <.> "tex") doc
       io $ setCurrentDirectory temp
@@ -274,15 +322,14 @@ imageForFormula (EnvironmentOptions {..}) (FormulaOptions {..}) eqn =
       (c',o',e') <- io $ flip (readProcessWithExitCode dvipsCommand) "" $ dvipsArgs ++ ["-q", "-E", "-o", tempFileBaseName <.> "ps", tempFileBaseName <.> "dvi"]
       io $ removeFile (tempFileBaseName <.> "dvi")
       when (c' /= ExitSuccess) $ throwE $ DVIPSFailure (o' ++ "\n" ++ e')
+      let bg = configBackgroundString config
       (c'', o'', e'') <- io $ flip (readProcessWithExitCode imageMagickCommand) "" $
                                 [ "-density", show dpi
-                                , "-bordercolor", "none"
-                                , "-border", "3x3"
-                                -- , "-trim"
-                                , "-type", "palette"
                                 , "+antialias"
-                                , "-background", "none"
-                                -- , "-splice","1x0"
+                                , "-background", bg
+                                , "-bordercolor", bg
+                                , "-border", "3x3"
+                                , "-type", "palette"
                                 ] ++ imageMagickArgs ++
                                 [ tempFileBaseName <.> "ps", tempFileBaseName <.> "png" ]
       io $ removeFile (tempFileBaseName <.> "ps")
@@ -298,36 +345,3 @@ imageForFormula (EnvironmentOptions {..}) (FormulaOptions {..}) eqn =
       UseSystemTempDir f -> withSystemTempDirectory f a
       UseCurrentDir f -> withTempDirectory "." f a
 
-postprocess :: DynamicImage -> Either RenderError (Int, DynamicImage)
-postprocess (ImageY8 i)     = second ImageY8     <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageY16 i)    = second ImageY16    <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageYF i)     = second ImageYF     <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageYA8 i)    = second ImageYA8    <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageYA16 i)   = second ImageYA16   <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageRGB8 i)   = second ImageRGB8   <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageRGB16 i)  = second ImageRGB16  <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageRGBF i)   = second ImageRGBF   <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageRGBA8 i)  = second ImageRGBA8  <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageRGBA16 i) = second ImageRGBA16 <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageYCbCr8 i) = second ImageYCbCr8 <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageCMYK8 i)  = second ImageCMYK8  <$> postprocess' i (pixelAt i 0 0)
-postprocess (ImageCMYK16 i) = second ImageCMYK16 <$> postprocess' i (pixelAt i 0 0)
-
-
-postprocess' :: (Eq a, Pixel a) => Image a -> a -> Either RenderError (Int, Image a)
-postprocess' img bg
-  = do startX <- note ImageIsEmpty $ listToMaybe $ dropWhile isEmptyCol [0.. imageWidth img - 1]
-       let (dotXs, postXs) = break isEmptyCol [startX .. imageWidth img]
-       postX <- note CannotDetectBaseline $ listToMaybe postXs
-       let postY = (+ 2) $ average $ dotXs >>= (\x -> takeWhile (not . isEmpty x) (dropWhile (isEmpty x) [0..imageHeight img - 1]))
-           average = uncurry div . foldl' (\(s,c) e -> (e+s,c+1)) (0,0)
-           newHeight = imageHeight img
-           newWidth  = imageWidth img - postX + 3
-           baseline  = imageHeight img - postY
-       let image = generateImage (pixelAt' . (+ postX)) newWidth newHeight
-       return (baseline, image)
-  where
-    isEmptyCol x = all (isEmpty x) [0.. imageHeight img - 1]
-    isEmpty x = (== bg) . pixelAt img x
-    pixelAt' x y | x < imageWidth img && y < imageHeight img = pixelAt img x y
-                 | otherwise = bg
