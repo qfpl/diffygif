@@ -1,6 +1,6 @@
 { mkDerivation, base, bytestring, data-default, Diff, directory
-, errors, filepath, hex, JuicyPixels, latex-formulae-image, mtl
-, pandoc, process, skylighting, stdenv, temporary, transformers
+, errors, filepath, hex, JuicyPixels, mtl, pandoc, process
+, skylighting, stdenv, temporary, transformers
 }:
 mkDerivation {
   pname = "diffygif";
@@ -10,8 +10,7 @@ mkDerivation {
   isExecutable = true;
   libraryHaskellDepends = [
     base bytestring data-default Diff directory errors filepath hex
-    JuicyPixels latex-formulae-image mtl pandoc process skylighting
-    temporary transformers
+    JuicyPixels mtl pandoc process skylighting temporary transformers
   ];
   executableHaskellDepends = [ base bytestring data-default mtl ];
   license = stdenv.lib.licenses.bsd3;

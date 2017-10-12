@@ -8,13 +8,16 @@ import qualified Data.ByteString.Lazy as B
 
 import Data.Default
 
-import Scratch
+import DiffyGif.Gif
+import DiffyGif.Diff
+import DiffyGif.Slides
 
 main :: IO ()
 main = do
   [fpIn, fpOut] <- getArgs
-  s <- loadAndOrderFiles fpIn
-  eb <- runExceptT $ makeGif def (chunkify s)
+  eb <- runExceptT $ do
+    s <- readSlides fpIn
+    makeGif def (slidesDiff def s)
   case eb of
     Left e -> print e
     Right b -> B.writeFile fpOut b

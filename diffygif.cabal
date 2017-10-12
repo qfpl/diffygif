@@ -13,7 +13,10 @@ extra-source-files:  changelog.md
 cabal-version:       >=1.10
 
 library
-  exposed-modules:     Scratch
+  exposed-modules:     DiffyGif.Slides
+                     , DiffyGif.Diff
+                     , DiffyGif.Gif
+                     , DiffyGif.Error
   build-depends:       base >=4.9 && <4.10
                      , mtl >=2.2 && <2.3
                      , bytestring
@@ -25,7 +28,6 @@ library
                      , skylighting
                      , hex
                      , JuicyPixels
-                     , latex-formulae-image
                      , errors
                      , process
                      , temporary
